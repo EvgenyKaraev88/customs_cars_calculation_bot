@@ -45,7 +45,7 @@ class CustomsCalculator:
             'KRW': 0.052     # 1 Корейская вона = 0,052 российский рубль (по умолчанию)
         }
         
-        # Таможенная пошлина для авто 3-5 лет (физические лица) в евро за 1 см³
+        # Таможенная пошлина для авто 3-5 лет (физические лица) в евро за 1 см³ (фото 1)
         self.duty_rates_3_5_years = [
             (0, 1000, 1.5),      # до 1000 см³
             (1000, 1500, 1.7),   # 1000-1500 см³
@@ -53,6 +53,16 @@ class CustomsCalculator:
             (1800, 2300, 2.7),   # 1800-2300 см³
             (2300, 3000, 3.0),   # 2300-3000 см³
             (3000, float('inf'), 3.6)  # свыше 3000 см³
+        ]
+        
+        # Таможенная пошлина для авто старше 5 лет (физические лица) в евро за 1 см³ (фото 2)
+        self.duty_rates_over_5_years = [
+            (0, 1000, 1.5),      # до 1000 см³
+            (1000, 1500, 1.7),   # 1000-1500 см³
+            (1500, 1800, 2.5),   # 1500-1800 см³
+            (1800, 2300, 2.7),   # 1800-2300 см³
+            (2300, 3000, 3.0),   # 2300-3000 см³
+            (3000, float('inf'), 3.2)  # свыше 3000 см³ (3.2 по фото 2)
         ]
         
         # Утилизационный сбор 2026 года (в рублях)
@@ -83,36 +93,55 @@ class CustomsCalculator:
         """Update exchange rates"""
         self.exchange_rates.update(new_rates)
     
-    def calculate_age(self, manufacture_date):
-        """Точно вычисляет возраст автомобиля в годах и месяцах на текущую дату"""
+    def calculate_precise_age(self, manufacture_date):
+        """Точно вычисляет возраст автомобиля в днях, годах и месяцах на текущую дату"""
         today = date.today()
         
-        # Рассчитываем полное количество месяцев разницы
-        total_months = (today.year - manufacture_date.year) * 12 + (today.month - manufacture_date.month)
+        # Разница в днях (точный возраст)
+        days_difference = (today - manufacture_date).days
         
-        # Учитываем дни: если текущий день месяца меньше дня производства, вычитаем 1 месяц
+        # Возраст в полных годах (для утильсбора)
+        years = days_difference // 365
+        remaining_days = days_difference % 365
+        
+        # Возраст в полных месяцах (для отображения)
+        total_months = (today.year - manufacture_date.year) * 12 + (today.month - manufacture_date.month)
         if today.day < manufacture_date.day:
             total_months -= 1
         
-        # Возраст в полных годах
-        years = total_months // 12
-        
-        # Остаточные месяцы
         months = total_months % 12
         
-        # Возраст в полных годах для расчетов (округляем вниз)
-        age_years = years
-        
-        # Учитываем, что если возраст 0 лет, но есть месяцы - это все равно возраст 0 лет
-        # Для расчета пошлин важны полные годы
-        return age_years, months
+        return {
+            'days': days_difference,
+            'years': years,
+            'months': months,
+            'full_years': today.year - manufacture_date.year - 
+                         ((today.month, today.day) < (manufacture_date.month, manufacture_date.day))
+        }
     
-    def get_duty_for_3_5_years(self, engine_volume_cm3):
-        """Calculate duty for cars 3-5 years old in euros"""
-        for min_vol, max_vol, rate in self.duty_rates_3_5_years:
-            if min_vol < engine_volume_cm3 <= max_vol:
-                return engine_volume_cm3 * rate
-        return engine_volume_cm3 * 3.6
+    def get_duty_for_age(self, engine_volume_cm3, age_days):
+        """Calculate duty based on exact age in days"""
+        # Определяем ставку пошлины в зависимости от возраста
+        if age_days < 3 * 365:  # Менее 3 лет (не включая день, когда исполняется 3 года)
+            return None  # Будет рассчитано как процент от инвойса
+        
+        elif 3 * 365 <= age_days <= 5 * 365:  # От 3 лет (включительно) до 5 лет (включительно)
+            # Используем ставки для 3-5 лет (фото 1)
+            for min_vol, max_vol, rate in self.duty_rates_3_5_years:
+                if min_vol < engine_volume_cm3 <= max_vol:
+                    return engine_volume_cm3 * rate
+        
+        else:  # Старше 5 лет (5 лет и 1 день и более)
+            # Используем ставки для старше 5 лет (фото 2)
+            for min_vol, max_vol, rate in self.duty_rates_over_5_years:
+                if min_vol < engine_volume_cm3 <= max_vol:
+                    return engine_volume_cm3 * rate
+        
+        # Если не попали в диапазон, используем максимальную ставку
+        if age_days <= 5 * 365:
+            return engine_volume_cm3 * 3.6  # Для 3-5 лет
+        else:
+            return engine_volume_cm3 * 3.2  # Для старше 5 лет
     
     def get_recycling_fee(self, engine_volume_l, hp, age_years):
         """Get recycling fee based on volume, HP and age with special cases"""
@@ -194,43 +223,45 @@ class CustomsCalculator:
                 manufacture_date_obj = today
         
         # Вычисляем точный возраст
-        age_years, age_months = self.calculate_age(manufacture_date_obj)
+        age_info = self.calculate_precise_age(manufacture_date_obj)
+        age_days = age_info['days']
+        age_years = age_info['full_years']  # Для утильсбора используем полные годы
         
         # Convert engine volume to cm³ for calculations
         engine_volume_cm3 = engine_volume * 1000
         
-        # Получаем утилизационный сбор
+        # Получаем утилизационный сбор (используем полные годы)
         recycling_fee = self.get_recycling_fee(engine_volume, hp, age_years)
         
-        # Determine calculation method based on age
-        if age_years < 1:
-            # Для автомобилей младше 1 года - 48% от стоимости + утильсбор
+        # Determine calculation method based on EXACT age in days
+        duty_euro = None
+        duty_type = ""
+        
+        if age_days < 3 * 365:  # Менее 3 лет (не включая день, когда исполняется 3 года)
+            # Для автомобилей младше 3 лет - 48% от стоимости + утильсбор
             customs_duty = rub_price * 0.48
-            duty_type = "48% от инвойса"
+            duty_type = f"48% от инвойса (возраст до 3 лет)"
             
-        elif 1 <= age_years <= 3:
-            # Для автомобилей 1-3 года - 48% от стоимости + утильсбор
-            customs_duty = rub_price * 0.48
-            duty_type = "48% от инвойса"
-            
-        elif 3 < age_years <= 5:
+        elif 3 * 365 <= age_days <= 5 * 365:  # От 3 лет (включительно) до 5 лет (включительно)
             # Для автомобилей 3-5 лет - фиксированная пошлина в евро + утильсбор
-            duty_euro = self.get_duty_for_3_5_years(engine_volume_cm3)
+            duty_euro = self.get_duty_for_age(engine_volume_cm3, age_days)
             customs_duty = duty_euro * self.exchange_rates['EUR']
-            duty_type = f"Фиксированная пошлина: {duty_euro:,.0f} EUR"
+            duty_type = f"Фиксированная пошлина (3-5 лет): {duty_euro:,.0f} EUR"
             
-        else:
-            # Для автомобилей старше 5 лет - 48% от стоимости + утильсбор
-            customs_duty = rub_price * 0.48
-            duty_type = "48% от инвойса (старше 5 лет)"
+        else:  # Старше 5 лет (5 лет и 1 день и более)
+            # Для автомобилей старше 5 лет - фиксированная пошлина по другим ставкам
+            duty_euro = self.get_duty_for_age(engine_volume_cm3, age_days)
+            customs_duty = duty_euro * self.exchange_rates['EUR']
+            duty_type = f"Фиксированная пошлина (старше 5 лет): {duty_euro:,.0f} EUR"
         
         total = customs_duty + recycling_fee
         
         return {
             'purchase_price': purchase_price,
             'currency': currency,
-            'vehicle_age_years': age_years,
-            'vehicle_age_months': age_months,
+            'vehicle_age_days': age_days,
+            'vehicle_age_years': age_info['years'],
+            'vehicle_age_months': age_info['months'],
             'engine_volume': engine_volume,
             'horsepower': hp,
             'importer_type': importer_type,
@@ -238,9 +269,20 @@ class CustomsCalculator:
             'recycling_fee': recycling_fee,  # уже в рублях
             'total_payable': round(total),
             'duty_type': duty_type,
+            'duty_euro': duty_euro,
             'rub_price': round(rub_price),
-            'manufacture_date': manufacture_date_obj.strftime("%d.%m.%Y")
+            'manufacture_date': manufacture_date_obj.strftime("%d.%m.%Y"),
+            'age_category': self.get_age_category(age_days)
         }
+    
+    def get_age_category(self, age_days):
+        """Определяет категорию возраста для отображения"""
+        if age_days < 3 * 365:
+            return "до 3 лет"
+        elif 3 * 365 <= age_days <= 5 * 365:
+            return "3-5 лет"
+        else:
+            return "старше 5 лет"
 
 async def update_exchange_rates(context: ContextTypes.DEFAULT_TYPE):
     """Update exchange rates from external source"""
@@ -250,7 +292,6 @@ async def update_exchange_rates(context: ContextTypes.DEFAULT_TYPE):
             return
         
         # Используем API Центрального Банка России для USD и EUR
-        # Используем API exchangerate-api.com или аналогичные для CNY и KRW
         async with aiohttp.ClientSession() as session:
             # Получаем курсы ЦБ РФ
             url_cbr = 'https://www.cbr-xml-daily.ru/daily_json.js'
@@ -268,20 +309,16 @@ async def update_exchange_rates(context: ContextTypes.DEFAULT_TYPE):
                     
                     logger.info(f"Курсы обновлены: USD={usd_rate:.2f}, EUR={eur_rate:.2f}")
         
-        # Для CNY и KRW используем другой источник (например, открытый API)
+        # Для CNY и KRW используем другой источник
         try:
             # Используем API с фиксированными курсами для CNY и KRW
-            # В реальном приложении нужно использовать актуальный API
-            # Например: https://api.exchangerate-api.com/v4/latest/RUB
             url_exchange = 'https://api.exchangerate-api.com/v4/latest/USD'
             async with session.get(url_exchange, timeout=10) as response:
                 if response.status == 200:
                     data = await response.json()
-                    # Получаем курсы через USD
                     usd_to_cny = data['rates']['CNY']
                     usd_to_krw = data['rates']['KRW']
                     
-                    # Рассчитываем курсы валют к рублю через USD
                     usd_rub = calculator.exchange_rates['USD']
                     cny_rub = round(usd_rub / usd_to_cny, 4)
                     krw_rub = round(usd_rub / usd_to_krw, 6)
@@ -294,7 +331,6 @@ async def update_exchange_rates(context: ContextTypes.DEFAULT_TYPE):
                     logger.info(f"Курсы обновлены: CNY={cny_rub}, KRW={krw_rub}")
         except Exception as e:
             logger.warning(f"Не удалось обновить курсы CNY/KRW: {e}")
-            # Используем фиксированные значения как запасной вариант
             calculator.update_exchange_rates({
                 'CNY': 11.0,
                 'KRW': 0.052
@@ -302,7 +338,6 @@ async def update_exchange_rates(context: ContextTypes.DEFAULT_TYPE):
             
     except Exception as e:
         logger.error(f"Ошибка при обновлении курсов валют: {e}")
-        # Используем значения по умолчанию в случае ошибки
         calculator = context.bot_data.get('calculator')
         if calculator:
             calculator.update_exchange_rates({
@@ -350,11 +385,23 @@ async def handle_start_choice(update: Update, context: ContextTypes.DEFAULT_TYPE
     elif text == "Информация о боте":
         info_text = (
             "📊 Этот бот рассчитывает таможенные пошлины для легковых автомобилей для личного пользования.\n\n"
-            "📈 Методика расчета:\n"
-            "• До 1 года: 48% от стоимости инвойса + утилизационный сбор\n"
-            "• 1-3 года: 48% от стоимости инвойса + утилизационный сбор\n"
-            "• 3-5 лет: фиксированная пошлина в евро (зависит от объема) + утилизационный сбор\n"
-            "• Старше 5 лет: 48% от стоимости инвойса + утилизационный сбор\n\n"
+            "📈 Методика расчета (точный расчет по дням):\n"
+            "• До 3 лет (не включая день, когда исполняется 3 года): 48% от стоимости инвойса + утилизационный сбор\n"
+            "• От 3 лет (включительно) до 5 лет (включительно): фиксированная пошлина в евро (зависит от объема) + утилизационный сбор\n"
+            "• Старше 5 лет (5 лет и 1 день): фиксированная пошлина в евро по другим ставкам + утилизационный сбор\n\n"
+            "🏷️ Таможенные пошлины:\n"
+            "• Для 3-5 лет:\n"
+            "  - До 1000 см³: 1,5 евро/см³\n"
+            "  - 1000-1500 см³: 1,7 евро/см³\n"
+            "  - 1500-1800 см³: 2,5 евро/см³\n"
+            "  - 1800-2300 см³: 2,7 евро/см³\n"
+            "  - 2300-3000 см³: 3,0 евро/см³\n"
+            "  - Свыше 3000 см³: 3,6 евро/см³\n\n"
+            "• Для старше 5 лет:\n"
+            "  - До 1000 см³: 1,5 евро/см³\n"
+            "  - 1500-1800 см³: 2,5 евро/см³\n"
+            "  - Свыше 3000 см³: 3,2 евро/см³\n"
+            "  (остальные диапазоны аналогичны 3-5 годам)\n\n"
             "♻️ Утилизационный сбор (2026 год):\n"
             "• Льготные тарифы:\n"
             "  - До 3.0л и до 160 л.с. (включительно), возраст 0-3 года: 3,400 руб\n"
@@ -362,19 +409,8 @@ async def handle_start_choice(update: Update, context: ContextTypes.DEFAULT_TYPE
             "• Таблица ставок (2026 год):\n"
             "  - 1.0-2.0 литра: от 900,000 до 2,203,200 руб\n"
             "  - 2.0-3.0 литра: от 2,306,800 до 4,572,000 руб\n\n"
-            "📅 Возраст автомобиля рассчитывается точно на текущую дату.\n"
-            "💱 Курсы валют обновляются автоматически из внешних источников.\n\n"
-            "📊 Диапазоны мощностей:\n"
-            "• 160-190 л.с. (160 включительно, 190 не включительно)\n"
-            "• 190-220 л.с. (190 включительно, 220 не включительно)\n"
-            "• 220-250 л.с. (220 включительно, 250 не включительно)\n"
-            "• 250-280 л.с. (250 включительно, 280 не включительно)\n"
-            "• 280-310 л.с. (280 включительно, 310 не включительно)\n"
-            "• 310-340 л.с. (310 включительно, 340 не включительно)\n"
-            "• 340-370 л.с. (340 включительно, 370 не включительно)\n"
-            "• 370-400 л.с. (370 включительно, 400 не включительно)\n"
-            "• 400-500 л.с. (400 включительно, 500 не включительно)\n"
-            "• Свыше 500 л.с. (500 включительно)"
+            "📅 Возраст автомобиля рассчитывается ТОЧНО по дням на текущую дату.\n"
+            "💱 Курсы валют обновляются автоматически из внешних источников."
         )
         
         await update.message.reply_text(info_text)
@@ -459,7 +495,8 @@ async def get_currency(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.edit_message_text(
         f"✅ Валюта: {currency}\n\n"
         "📅 Введите дату производства автомобиля в формате ГГГГ-ММ-ДД.\n"
-        "Пример: 2022-05-15 или 15.05.2022"
+        "Пример: 2022-05-15 или 15.05.2022\n\n"
+        "⚠️ Важно: возраст рассчитывается ТОЧНО по дням!"
     )
     return MANUFACTURE_DATE
 
@@ -581,26 +618,37 @@ async def get_importer_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     recycling_fee_type = "льготный (3-5 лет, до 160 л.с.)"
             
             # Форматируем и отправляем результаты
+            age_display = f"{result['vehicle_age_years']} лет {result['vehicle_age_months']} месяцев"
+            
             response = (
                 f"📊 РЕЗУЛЬТАТЫ РАСЧЕТА ТАМОЖНИ\n"
                 f"═══════════════════════════════\n"
                 f"💰 Стоимость покупки: {result['purchase_price']:,.2f} {result['currency']}\n"
                 f"   (≈ {result['rub_price']:,} RUB)\n"
                 f"📅 Дата производства: {result['manufacture_date']}\n"
-                f"📅 Возраст автомобиля: {result['vehicle_age_years']} лет {result['vehicle_age_months']} месяцев\n"
+                f"📅 Возраст автомобиля: {age_display}\n"
+                f"📅 Категория возраста: {result['age_category']}\n"
                 f"⚙️ Объем двигателя: {result['engine_volume']} л ({result['engine_volume']*1000:.0f} см³)\n"
                 f"🐎 Мощность: {result['horsepower']} л.с.\n"
                 f"👤 Тип импортера: {result['importer_type']}\n"
                 f"═══════════════════════════════\n"
                 f"📝 Тип расчета: {result['duty_type']}\n"
+                if result['duty_euro'] is not None else ""
+            )
+            
+            if result['duty_euro'] is not None:
+                response += f"📝 Пошлина в EUR: {result['duty_euro']:,.0f} EUR\n"
+            
+            response += (
                 f"📝 Таможенная пошлина: {result['customs_duty']:,} RUB\n"
                 f"♻️ Утилизационный сбор ({recycling_fee_type}): {result['recycling_fee']:,} RUB\n"
                 f"═══════════════════════════════\n"
                 f"💵 ВСЕГО К ОПЛАТЕ: {result['total_payable']:,} RUB\n"
                 f"═══════════════════════════════\n\n"
-                f"*Расчет выполнен для физических лиц на 2026 год.\n"
+                f"*Расчет выполнен для физических лиц.\n"
                 f"Курс EUR = {calculator.exchange_rates['EUR']:.2f} RUB\n"
-                f"Курс USD = {calculator.exchange_rates['USD']:.2f} RUB"
+                f"Курс USD = {calculator.exchange_rates['USD']:.2f} RUB\n"
+                f"Возраст рассчитан точно по дням ({result['vehicle_age_days']} дней)"
             )
             
             await update.message.reply_text(response)
@@ -666,7 +714,7 @@ async def post_init(application: Application):
     # Schedule regular updates every hour
     job_queue = application.job_queue
     if job_queue:
-        job_queue.run_repeating(update_exchange_rates, interval=3600, first=3600)  # Every hour
+        job_queue.run_repeating(update_exchange_rates, interval=3600, first=3600)
 
 def main():
     """Run the bot"""
@@ -720,5 +768,4 @@ def main():
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == '__main__':
-    # Install required packages: pip install aiohttp python-telegram-bot
     main()
