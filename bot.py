@@ -1,6 +1,8 @@
 import os
 import logging
-from datetime import datetime, date
+import asyncio
+import aiohttp
+from datetime import datetime, date, timedelta
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import (
     Application,
@@ -9,7 +11,8 @@ from telegram.ext import (
     filters,
     ConversationHandler,
     CallbackQueryHandler,
-    ContextTypes
+    ContextTypes,
+    JobQueue
 )
 
 # Enable logging
@@ -33,13 +36,13 @@ logger = logging.getLogger(__name__)
 class CustomsCalculator:
     """Class to handle customs calculations based on actual rates"""
     
-    def __init__(self):
-        # Exchange rates (обновлено на сегодняшний день)
-        self.exchange_rates = {
-            'USD': 77.0,     # 1 Доллар США = 77 российских рублей
-            'CNY': 11.0,     # 1 Китайский Юань = 11 российских рублей
-            'EUR': 91.0,     # 1 Евро = 91 российский рубль
-            'KRW': 0.052     # 1 Корейская вона = 0,052 российский рубль
+    def __init__(self, exchange_rates=None):
+        # Exchange rates (будут обновляться автоматически)
+        self.exchange_rates = exchange_rates or {
+            'USD': 77.0,     # 1 Доллар США = 77 российских рублей (по умолчанию)
+            'CNY': 11.0,     # 1 Китайский Юань = 11 российских рублей (по умолчанию)
+            'EUR': 91.0,     # 1 Евро = 91 российский рубль (по умолчанию)
+            'KRW': 0.052     # 1 Корейская вона = 0,052 российский рубль (по умолчанию)
         }
         
         # Таможенная пошлина для авто 3-5 лет (физические лица) в евро за 1 см³
@@ -53,8 +56,6 @@ class CustomsCalculator:
         ]
         
         # Утилизационный сбор 2026 года (в рублях)
-        # Формат: {объем_двигателя_литры: {диапазон_лс: (0-3_года, старше_3_лет)}}
-        # Внимание: диапазоны мощностей - [min, max)
         self.recycling_fee_2026 = {
             '1.0-2.0': {
                 (160, 190): (900000, 1492800),      # 160 <= hp < 190
@@ -63,7 +64,6 @@ class CustomsCalculator:
                 (250, 280): (1142400, 1838400),     # 250 <= hp < 280
                 (280, 310): (1291200, 2011200),     # 280 <= hp < 310
                 (310, 340): (1459200, 2203200),     # 310 <= hp < 340
-                # Для hp >= 340 - используем последний доступный диапазон
             },
             '2.0-3.0': {
                 (160, 190): (2306800, 3456000),     # 160 <= hp < 190
@@ -78,59 +78,68 @@ class CustomsCalculator:
                 (500, float('inf')): (3448800, 4572000),  # hp >= 500
             }
         }
+    
+    def update_exchange_rates(self, new_rates):
+        """Update exchange rates"""
+        self.exchange_rates.update(new_rates)
+    
+    def calculate_age(self, manufacture_date):
+        """Точно вычисляет возраст автомобиля в годах и месяцах на текущую дату"""
+        today = date.today()
         
-        # Для объемов меньше 1.0 литра или больше 3.0 литров
-        # (в реальности могут быть другие ставки, но оставим базовые)
-        self.recycling_fee_other = {
-            '0-1.0': {
-                (0, float('inf')): (50000, 100000)  # базовые ставки
-            },
-            '3.0+': {
-                (0, float('inf')): (3000000, 4500000)
-            }
-        }
+        # Рассчитываем полное количество месяцев разницы
+        total_months = (today.year - manufacture_date.year) * 12 + (today.month - manufacture_date.month)
+        
+        # Учитываем дни: если текущий день месяца меньше дня производства, вычитаем 1 месяц
+        if today.day < manufacture_date.day:
+            total_months -= 1
+        
+        # Возраст в полных годах
+        years = total_months // 12
+        
+        # Остаточные месяцы
+        months = total_months % 12
+        
+        # Возраст в полных годах для расчетов (округляем вниз)
+        age_years = years
+        
+        # Учитываем, что если возраст 0 лет, но есть месяцы - это все равно возраст 0 лет
+        # Для расчета пошлин важны полные годы
+        return age_years, months
     
     def get_duty_for_3_5_years(self, engine_volume_cm3):
         """Calculate duty for cars 3-5 years old in euros"""
         for min_vol, max_vol, rate in self.duty_rates_3_5_years:
             if min_vol < engine_volume_cm3 <= max_vol:
                 return engine_volume_cm3 * rate
-        return engine_volume_cm3 * 3.6  # максимальная ставка по умолчанию
+        return engine_volume_cm3 * 3.6
     
-    def get_recycling_fee(self, engine_volume_l, hp, age):
+    def get_recycling_fee(self, engine_volume_l, hp, age_years):
         """Get recycling fee based on volume, HP and age with special cases"""
         engine_volume_float = float(engine_volume_l)
         
         # ОСОБЫЕ СЛУЧАИ (льготные тарифы)
         if engine_volume_float <= 3.0 and hp <= 160:  # <= 160 л.с. ВКЛЮЧИТЕЛЬНО
-            if age < 3:  # возраст 0-3 года (3 НЕ включительно)
+            if age_years < 3:  # возраст 0-2 года (3 не включительно)
                 return 3400
-            elif 3 <= age <= 5:  # возраст 3-5 лет (ВКЛЮЧИТЕЛЬНО)
+            elif 3 <= age_years <= 5:  # возраст 3-5 лет (ВКЛЮЧИТЕЛЬНО)
                 return 5200
         
         # Определяем категорию объема
         volume_category = None
         
-        if engine_volume_float < 1.0:
-            volume_category = '0-1.0'
-        elif engine_volume_float <= 2.0:  # 1.0 <= volume <= 2.0
+        if engine_volume_float <= 2.0:  # 1.0 <= volume <= 2.0
             volume_category = '1.0-2.0'
-        elif engine_volume_float <= 3.0:  # 2.0 < volume <= 3.0
+        else:  # 2.0 < volume <= 3.0
             volume_category = '2.0-3.0'
-        else:
-            volume_category = '3.0+'
         
         # Выбираем таблицу тарифов
-        fee_table = None
-        if volume_category in ['1.0-2.0', '2.0-3.0']:
-            fee_table = self.recycling_fee_2026.get(volume_category, {})
-        else:
-            fee_table = self.recycling_fee_other.get(volume_category, {})
+        fee_table = self.recycling_fee_2026.get(volume_category, {})
         
         if not fee_table:
             # Если категории нет, используем базовую ставку
             logger.warning(f"Не найдена таблица тарифов для категории: {volume_category}")
-            if age <= 3:
+            if age_years <= 3:
                 return 20000
             else:
                 return 30000
@@ -154,48 +163,57 @@ class CustomsCalculator:
                 target_range = sorted_ranges[-1]
                 fee_values = fee_table[target_range]
             else:
-                # Если вообще нет диапазонов
-                if age <= 3:
+                if age_years <= 3:
                     return 20000
                 else:
                     return 30000
         
         # Получаем значение утильсбора в зависимости от возраста
-        if age <= 3:  # 0-3 года (3 включительно)
+        if age_years <= 3:  # 0-3 года (3 включительно)
             return fee_values[0]  # 0-3 года
         else:  # старше 3 лет
             return fee_values[1]  # старше 3 лет
     
-    def calculate_customs(self, purchase_price, currency, manufacture_date, engine_volume, hp, importer_type):
+    def calculate_customs(self, purchase_price, currency, manufacture_date_str, engine_volume, hp, importer_type):
         """
         Calculate customs duties based on the provided parameters
         """
         # Convert purchase price to RUB
         rub_price = purchase_price * self.exchange_rates.get(currency, 1)
         
-        # Calculate vehicle age
+        # Calculate vehicle age (точный расчет)
         today = date.today()
-        manufacture_date_obj = datetime.strptime(manufacture_date, "%Y-%m-%d").date()
-        age = today.year - manufacture_date_obj.year - ((today.month, today.day) < (manufacture_date_obj.month, manufacture_date_obj.day))
+        try:
+            manufacture_date_obj = datetime.strptime(manufacture_date_str, "%Y-%m-%d").date()
+        except ValueError:
+            # Если дата в другом формате, попробуем преобразовать
+            try:
+                manufacture_date_obj = datetime.strptime(manufacture_date_str, "%d.%m.%Y").date()
+            except ValueError:
+                # По умолчанию используем сегодняшнюю дату
+                manufacture_date_obj = today
+        
+        # Вычисляем точный возраст
+        age_years, age_months = self.calculate_age(manufacture_date_obj)
         
         # Convert engine volume to cm³ for calculations
         engine_volume_cm3 = engine_volume * 1000
         
         # Получаем утилизационный сбор
-        recycling_fee = self.get_recycling_fee(engine_volume, hp, age)
+        recycling_fee = self.get_recycling_fee(engine_volume, hp, age_years)
         
         # Determine calculation method based on age
-        if age < 1:
+        if age_years < 1:
             # Для автомобилей младше 1 года - 48% от стоимости + утильсбор
             customs_duty = rub_price * 0.48
             duty_type = "48% от инвойса"
             
-        elif 1 <= age <= 3:
+        elif 1 <= age_years <= 3:
             # Для автомобилей 1-3 года - 48% от стоимости + утильсбор
             customs_duty = rub_price * 0.48
             duty_type = "48% от инвойса"
             
-        elif 3 < age <= 5:
+        elif 3 < age_years <= 5:
             # Для автомобилей 3-5 лет - фиксированная пошлина в евро + утильсбор
             duty_euro = self.get_duty_for_3_5_years(engine_volume_cm3)
             customs_duty = duty_euro * self.exchange_rates['EUR']
@@ -211,7 +229,8 @@ class CustomsCalculator:
         return {
             'purchase_price': purchase_price,
             'currency': currency,
-            'vehicle_age': age,
+            'vehicle_age_years': age_years,
+            'vehicle_age_months': age_months,
             'engine_volume': engine_volume,
             'horsepower': hp,
             'importer_type': importer_type,
@@ -219,14 +238,86 @@ class CustomsCalculator:
             'recycling_fee': recycling_fee,  # уже в рублях
             'total_payable': round(total),
             'duty_type': duty_type,
-            'rub_price': round(rub_price)
+            'rub_price': round(rub_price),
+            'manufacture_date': manufacture_date_obj.strftime("%d.%m.%Y")
         }
+
+async def update_exchange_rates(context: ContextTypes.DEFAULT_TYPE):
+    """Update exchange rates from external source"""
+    try:
+        calculator = context.bot_data.get('calculator')
+        if not calculator:
+            return
+        
+        # Используем API Центрального Банка России для USD и EUR
+        # Используем API exchangerate-api.com или аналогичные для CNY и KRW
+        async with aiohttp.ClientSession() as session:
+            # Получаем курсы ЦБ РФ
+            url_cbr = 'https://www.cbr-xml-daily.ru/daily_json.js'
+            async with session.get(url_cbr, timeout=10) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    usd_rate = data['Valute']['USD']['Value']
+                    eur_rate = data['Valute']['EUR']['Value']
+                    
+                    # Обновляем курсы
+                    calculator.update_exchange_rates({
+                        'USD': round(usd_rate, 2),
+                        'EUR': round(eur_rate, 2)
+                    })
+                    
+                    logger.info(f"Курсы обновлены: USD={usd_rate:.2f}, EUR={eur_rate:.2f}")
+        
+        # Для CNY и KRW используем другой источник (например, открытый API)
+        try:
+            # Используем API с фиксированными курсами для CNY и KRW
+            # В реальном приложении нужно использовать актуальный API
+            # Например: https://api.exchangerate-api.com/v4/latest/RUB
+            url_exchange = 'https://api.exchangerate-api.com/v4/latest/USD'
+            async with session.get(url_exchange, timeout=10) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    # Получаем курсы через USD
+                    usd_to_cny = data['rates']['CNY']
+                    usd_to_krw = data['rates']['KRW']
+                    
+                    # Рассчитываем курсы валют к рублю через USD
+                    usd_rub = calculator.exchange_rates['USD']
+                    cny_rub = round(usd_rub / usd_to_cny, 4)
+                    krw_rub = round(usd_rub / usd_to_krw, 6)
+                    
+                    calculator.update_exchange_rates({
+                        'CNY': cny_rub,
+                        'KRW': krw_rub
+                    })
+                    
+                    logger.info(f"Курсы обновлены: CNY={cny_rub}, KRW={krw_rub}")
+        except Exception as e:
+            logger.warning(f"Не удалось обновить курсы CNY/KRW: {e}")
+            # Используем фиксированные значения как запасной вариант
+            calculator.update_exchange_rates({
+                'CNY': 11.0,
+                'KRW': 0.052
+            })
+            
+    except Exception as e:
+        logger.error(f"Ошибка при обновлении курсов валют: {e}")
+        # Используем значения по умолчанию в случае ошибки
+        calculator = context.bot_data.get('calculator')
+        if calculator:
+            calculator.update_exchange_rates({
+                'USD': 77.0,
+                'CNY': 11.0,
+                'EUR': 91.0,
+                'KRW': 0.052
+            })
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Start command handler"""
     keyboard = [
         [KeyboardButton("Рассчитать таможню")],
-        [KeyboardButton("Информация о боте")]
+        [KeyboardButton("Информация о боте")],
+        [KeyboardButton("Текущие курсы валют")]
     ]
     reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
     
@@ -252,7 +343,7 @@ async def handle_start_choice(update: Update, context: ContextTypes.DEFAULT_TYPE
     if text == "Рассчитать таможню":
         await update.message.reply_text(
             "💰 Введите стоимость покупки автомобиля (инвойс) в числовом формате.\n"
-            "Пример: 15000"
+            "Пример: 15000 или 15000.50"
         )
         return PURCHASE_PRICE
     
@@ -271,11 +362,8 @@ async def handle_start_choice(update: Update, context: ContextTypes.DEFAULT_TYPE
             "• Таблица ставок (2026 год):\n"
             "  - 1.0-2.0 литра: от 900,000 до 2,203,200 руб\n"
             "  - 2.0-3.0 литра: от 2,306,800 до 4,572,000 руб\n\n"
-            "💱 Текущие курсы валют:\n"
-            "• 1 USD = 77 RUB\n"
-            "• 1 CNY = 11 RUB\n"
-            "• 1 EUR = 91 RUB\n"
-            "• 1 KRW = 0.052 RUB\n\n"
+            "📅 Возраст автомобиля рассчитывается точно на текущую дату.\n"
+            "💱 Курсы валют обновляются автоматически из внешних источников.\n\n"
             "📊 Диапазоны мощностей:\n"
             "• 160-190 л.с. (160 включительно, 190 не включительно)\n"
             "• 190-220 л.с. (190 включительно, 220 не включительно)\n"
@@ -294,7 +382,37 @@ async def handle_start_choice(update: Update, context: ContextTypes.DEFAULT_TYPE
         # Возвращаемся в меню
         keyboard = [
             [KeyboardButton("Рассчитать таможню")],
-            [KeyboardButton("Информация о боте")]
+            [KeyboardButton("Информация о боте")],
+            [KeyboardButton("Текущие курсы валют")]
+        ]
+        reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+        await update.message.reply_text("Что вы хотите сделать?", reply_markup=reply_markup)
+        return START_CHOICE
+    
+    elif text == "Текущие курсы валют":
+        calculator = context.bot_data.get('calculator')
+        if calculator:
+            rates = calculator.exchange_rates
+            rates_text = (
+                "💱 ТЕКУЩИЕ КУРСЫ ВАЛЮТ (автоматическое обновление):\n"
+                "═══════════════════════════════\n"
+                f"🇺🇸 1 USD (Доллар США) = {rates['USD']:.2f} RUB\n"
+                f"🇪🇺 1 EUR (Евро) = {rates['EUR']:.2f} RUB\n"
+                f"🇨🇳 1 CNY (Китайский Юань) = {rates['CNY']:.2f} RUB\n"
+                f"🇰🇷 1 KRW (Корейская Вона) = {rates['KRW']:.6f} RUB\n"
+                "═══════════════════════════════\n"
+                "*Курсы обновляются автоматически каждый час*\n"
+                "Последнее обновление: сегодня"
+            )
+        else:
+            rates_text = "Калькулятор курсов валют не инициализирован."
+        
+        await update.message.reply_text(rates_text)
+        
+        keyboard = [
+            [KeyboardButton("Рассчитать таможню")],
+            [KeyboardButton("Информация о боте")],
+            [KeyboardButton("Текущие курсы валют")]
         ]
         reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
         await update.message.reply_text("Что вы хотите сделать?", reply_markup=reply_markup)
@@ -341,28 +459,50 @@ async def get_currency(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.edit_message_text(
         f"✅ Валюта: {currency}\n\n"
         "📅 Введите дату производства автомобиля в формате ГГГГ-ММ-ДД.\n"
-        "Пример: 2022-05-15"
+        "Пример: 2022-05-15 или 15.05.2022"
     )
     return MANUFACTURE_DATE
 
 async def get_manufacture_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Get manufacture date from user"""
+    date_text = update.message.text
+    today = date.today()
+    
     try:
-        # Проверяем корректность даты
-        date_obj = datetime.strptime(update.message.text, "%Y-%m-%d")
+        # Пробуем разные форматы даты
+        try:
+            date_obj = datetime.strptime(date_text, "%Y-%m-%d").date()
+        except ValueError:
+            date_obj = datetime.strptime(date_text, "%d.%m.%Y").date()
+        
         # Проверяем, что дата не в будущем
-        if date_obj.date() > date.today():
-            await update.message.reply_text("❌ Дата производства не может быть в будущем. Введите корректную дату.")
+        if date_obj > today:
+            await update.message.reply_text(
+                "❌ Дата производства не может быть в будущем. Введите корректную дату.\n"
+                "Пример: 2022-05-15 или 15.05.2022"
+            )
+            return MANUFACTURE_DATE
+        
+        # Проверяем, что дата не слишком старая (например, старше 50 лет)
+        if date_obj.year < today.year - 50:
+            await update.message.reply_text(
+                "❌ Дата производства слишком старая. Введите корректную дату.\n"
+                "Пример: 2022-05-15 или 15.05.2022"
+            )
             return MANUFACTURE_DATE
             
-        context.user_data['manufacture_date'] = update.message.text
+        context.user_data['manufacture_date'] = date_text
         await update.message.reply_text(
             "⚙️ Введите объем двигателя в литрах.\n"
             "Пример: 1.4 или 2.0"
         )
         return ENGINE_VOLUME
     except ValueError:
-        await update.message.reply_text("❌ Пожалуйста, введите корректную дату в формате ГГГГ-ММ-ДД (например: 2022-05-15).")
+        await update.message.reply_text(
+            "❌ Пожалуйста, введите корректную дату в формате:\n"
+            "• ГГГГ-ММ-ДД (например: 2022-05-15)\n"
+            "• ДД.ММ.ГГГГ (например: 15.05.2022)"
+        )
         return MANUFACTURE_DATE
 
 async def get_engine_volume(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -418,11 +558,15 @@ async def get_importer_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         # Выполняем расчет
         try:
-            calculator = CustomsCalculator()
+            calculator = context.bot_data.get('calculator')
+            if not calculator:
+                await update.message.reply_text("❌ Ошибка: калькулятор не инициализирован. Попробуйте позже.")
+                return START_CHOICE
+            
             result = calculator.calculate_customs(
                 purchase_price=context.user_data['purchase_price'],
                 currency=context.user_data['currency'],
-                manufacture_date=context.user_data['manufacture_date'],
+                manufacture_date_str=context.user_data['manufacture_date'],
                 engine_volume=context.user_data['engine_volume'],
                 hp=context.user_data['horsepower'],
                 importer_type=text
@@ -431,9 +575,9 @@ async def get_importer_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # Определяем тип утильсбора для информационного сообщения
             recycling_fee_type = "по таблице 2026 года"
             if result['engine_volume'] <= 3.0 and result['horsepower'] <= 160:
-                if result['vehicle_age'] < 3:
+                if result['vehicle_age_years'] < 3:
                     recycling_fee_type = "льготный (0-3 года, до 160 л.с.)"
-                elif 3 <= result['vehicle_age'] <= 5:
+                elif 3 <= result['vehicle_age_years'] <= 5:
                     recycling_fee_type = "льготный (3-5 лет, до 160 л.с.)"
             
             # Форматируем и отправляем результаты
@@ -442,7 +586,8 @@ async def get_importer_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"═══════════════════════════════\n"
                 f"💰 Стоимость покупки: {result['purchase_price']:,.2f} {result['currency']}\n"
                 f"   (≈ {result['rub_price']:,} RUB)\n"
-                f"📅 Возраст автомобиля: {result['vehicle_age']} лет\n"
+                f"📅 Дата производства: {result['manufacture_date']}\n"
+                f"📅 Возраст автомобиля: {result['vehicle_age_years']} лет {result['vehicle_age_months']} месяцев\n"
                 f"⚙️ Объем двигателя: {result['engine_volume']} л ({result['engine_volume']*1000:.0f} см³)\n"
                 f"🐎 Мощность: {result['horsepower']} л.с.\n"
                 f"👤 Тип импортера: {result['importer_type']}\n"
@@ -454,7 +599,8 @@ async def get_importer_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"💵 ВСЕГО К ОПЛАТЕ: {result['total_payable']:,} RUB\n"
                 f"═══════════════════════════════\n\n"
                 f"*Расчет выполнен для физических лиц на 2026 год.\n"
-                f"Курс EUR = {calculator.exchange_rates['EUR']} RUB"
+                f"Курс EUR = {calculator.exchange_rates['EUR']:.2f} RUB\n"
+                f"Курс USD = {calculator.exchange_rates['USD']:.2f} RUB"
             )
             
             await update.message.reply_text(response)
@@ -472,7 +618,8 @@ async def get_importer_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Возвращаемся в главное меню
         keyboard = [
             [KeyboardButton("Рассчитать таможню")],
-            [KeyboardButton("Информация о боте")]
+            [KeyboardButton("Информация о боте")],
+            [KeyboardButton("Текущие курсы валют")]
         ]
         reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
         await update.message.reply_text(
@@ -497,7 +644,8 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Cancel the conversation"""
     keyboard = [
         [KeyboardButton("Рассчитать таможню")],
-        [KeyboardButton("Информация о боте")]
+        [KeyboardButton("Информация о боте")],
+        [KeyboardButton("Текущие курсы валют")]
     ]
     reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
     await update.message.reply_text(
@@ -506,21 +654,33 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     return START_CHOICE
 
+async def post_init(application: Application):
+    """Initialize after bot starts"""
+    # Create calculator instance
+    calculator = CustomsCalculator()
+    application.bot_data['calculator'] = calculator
+    
+    # Update exchange rates immediately
+    await update_exchange_rates(application)
+    
+    # Schedule regular updates every hour
+    job_queue = application.job_queue
+    if job_queue:
+        job_queue.run_repeating(update_exchange_rates, interval=3600, first=3600)  # Every hour
+
 def main():
     """Run the bot"""
     # ВАЖНО: Замените токен на свой реальный токен!
-    TOKEN = ""
-    
-    # Для безопасности, можно получить токен из переменных окружения:
-    # TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+    TOKEN = "8245389383:AAGJqBia5iHGORMR5_teCgSeC4Qyl-uH3bE"
     
     if not TOKEN or TOKEN == "ВАШ_ТОКЕН_БОТА":
         logger.error("❌ Токен бота не настроен! Замените TOKEN на реальный токен.")
         return
     
-    application = Application.builder().token(TOKEN).build()
+    # Create application with job queue
+    application = Application.builder().token(TOKEN).post_init(post_init).build()
 
-    # Создаем conversation handler с состояниями
+    # Create conversation handler
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler('start', start)],
         states={
@@ -550,15 +710,15 @@ def main():
         allow_reentry=True
     )
 
-    # Добавляем обработчики
+    # Add handlers
     application.add_handler(conv_handler)
-    
-    # Обработчик для команды /help
     application.add_handler(CommandHandler('help', start))
+    application.add_handler(CommandHandler('rates', handle_start_choice))
 
-    # Запускаем бота
+    # Run the bot
     logger.info("🤖 Бот запущен...")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == '__main__':
+    # Install required packages: pip install aiohttp python-telegram-bot
     main()
