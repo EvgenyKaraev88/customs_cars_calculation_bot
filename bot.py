@@ -671,7 +671,7 @@ async def post_init(application: Application):
 def main():
     """Run the bot"""
     # ВАЖНО: Замените токен на свой реальный токен!
-    TOKEN = "8245389383:AAGJqBia5iHGORMR5_teCgSeC4Qyl-uH3bE"
+    TOKEN = ""
     
     if not TOKEN or TOKEN == "ВАШ_ТОКЕН_БОТА":
         logger.error("❌ Токен бота не настроен! Замените TOKEN на реальный токен.")
